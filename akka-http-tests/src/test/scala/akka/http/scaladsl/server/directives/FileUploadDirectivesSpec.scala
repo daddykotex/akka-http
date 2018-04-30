@@ -5,6 +5,7 @@
 package akka.http.scaladsl.server.directives
 
 import java.io.File
+import java.nio.file.Paths
 
 import akka.NotUsed
 import akka.http.scaladsl.model._
@@ -14,6 +15,7 @@ import akka.stream.scaladsl.Source
 import akka.util.ByteString
 import akka.testkit._
 
+import scala.collection.immutable
 import scala.concurrent.Future
 import scala.concurrent.duration._
 
@@ -234,6 +236,52 @@ class FileUploadDirectivesSpec extends RoutingSpec {
 
       Post("/", multipartForm) ~> route ~> check {
         rejection shouldEqual MissingFormFieldRejection("missing")
+      }
+
+    }
+
+  }
+
+  "the formAndFiles directive" should {
+    def tempDest(name: String)(fileInfo: FileInfo): File = {
+      val dest = File.createTempFile(s"akka-http-FileUploadDirectivesSpec-$name", ".tmp")
+      dest
+    }
+
+    def echoAsAService =
+      extractRequestContext { ctx ⇒
+        implicit val mat = ctx.materializer
+        val fileFields = immutable.Seq("python-dependency-set-example.zip" -> tempDest("whocares") _)
+        formAndFiles(fileFields) {
+          case PartsAndFiles(form, files) ⇒
+            println(form)
+            println(files)
+            complete(Ok)
+        }
+      }
+
+    "keep the form and stream the files" in {
+      val route = echoAsAService
+
+      val str1 = "foo"
+      val field1 = Multipart.FormData.BodyPart.Strict(
+        "field1",
+        HttpEntity(ContentTypes.`text/plain(UTF-8)`, str1),
+        Map.empty
+      )
+      val str2 = "bar"
+      val field2 = Multipart.FormData.BodyPart.Strict(
+        "field2",
+        HttpEntity(ContentTypes.`text/plain(UTF-8)`, str2),
+        Map.empty
+      )
+
+      val fileNamePath = "/Users/davidfrancoeur/Desktop/python-dependency-set-example.zip"
+      val filePart = Multipart.FormData.BodyPart.fromPath("file", ContentType(MediaTypes.`application/zip`), Paths.get(fileNamePath))
+      val multipartFormWithFile = Multipart.FormData(field1, field2, filePart)
+
+      Post("/", multipartFormWithFile) ~> route ~> check {
+        status shouldEqual StatusCodes.OK
       }
 
     }

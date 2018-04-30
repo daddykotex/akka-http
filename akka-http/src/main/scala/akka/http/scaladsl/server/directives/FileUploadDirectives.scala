@@ -8,7 +8,7 @@ import java.io.File
 
 import akka.annotation.ApiMayChange
 import akka.http.scaladsl.server.{ Directive, Directive1, MissingFormFieldRejection }
-import akka.http.scaladsl.model.{ ContentType, Multipart }
+import akka.http.scaladsl.model.{ ContentType, Multipart, HttpEntity }
 import akka.util.ByteString
 
 import scala.collection.immutable
@@ -108,6 +108,53 @@ trait FileUploadDirectives {
       }
     }
 
+  type FileNameFn = FileInfo ⇒ File
+  def formAndFiles(
+    fileFields: immutable.Seq[(String, FileNameFn)]
+  ): Directive1[PartsAndFiles] =
+    entity(as[Multipart.FormData]).flatMap { formData ⇒
+      extractRequestContext.flatMap { ctx ⇒
+        implicit val mat = ctx.materializer
+        implicit val ec = ctx.executionContext
+
+        val uploadingSink =
+          Sink.foldAsync[PartsAndFiles, Multipart.FormData.BodyPart](PartsAndFiles.Empty) {
+            (acc, part) ⇒
+              def discard(): Future[PartsAndFiles] = {
+                part.entity.discardBytes()
+                Future.successful(acc)
+              }
+
+              part.filename.map { fileName ⇒
+                fileFields.find(_._1 == part.name)
+                  .map {
+                    case (fieldName, destFn) ⇒
+                      val fileInfo = FileInfo(part.name, part.filename.get, part.entity.contentType)
+                      val dest = destFn(fileInfo)
+
+                      part.entity.dataBytes.runWith(FileIO.toPath(dest.toPath)).map { _ ⇒
+                        acc.addFile(fileInfo, dest)
+                      }
+                  }.getOrElse(discard())
+              } getOrElse {
+                part.entity match {
+                  case HttpEntity.Strict(ct, data) if ct.isInstanceOf[ContentType.NonBinary] ⇒
+                    val charsetName = ct.asInstanceOf[ContentType.NonBinary].charset.nioCharset.name
+                    val partContent = data.decodeString(charsetName)
+
+                    Future.successful(acc.addForm(part.name, partContent))
+                  case _ ⇒
+                    discard()
+                }
+              }
+          }
+
+        val uploadedF = formData.parts.runWith(uploadingSink)
+
+        onSuccess(uploadedF)
+      }
+    }
+
   /**
    * Collects each body part that is a multipart file as a tuple containing metadata and a `Source`
    * for streaming the file contents somewhere. If there is no such field the request will be rejected,
@@ -182,4 +229,25 @@ final case class FileInfo(fieldName: String, fileName: String, contentType: Cont
   override def getFieldName = fieldName
   override def getFileName = fileName
   override def getContentType = contentType
+}
+
+final case class PartsAndFiles(form: immutable.Map[String, List[String]], files: immutable.Seq[(FileInfo, File)]) {
+  def addForm(fieldName: String, content: String): PartsAndFiles = this.copy(
+    form = {
+
+      val existingContent: List[String] =
+        this.form
+          .get(fieldName)
+          .getOrElse(List.empty)
+      val newContents: List[String] = content :: existingContent
+
+      this.form + (fieldName -> newContents)
+    }
+  )
+  def addFile(info: FileInfo, file: File): PartsAndFiles = this.copy(
+    files = this.files :+ ((info, file))
+  )
+}
+object PartsAndFiles {
+  val Empty = PartsAndFiles(immutable.Map.empty, immutable.Seq.empty)
 }
